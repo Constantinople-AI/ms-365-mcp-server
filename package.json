@@ -1,5 +1,5 @@
 {
-  "name": "@softeria/ms-365-mcp-server",
+  "name": "@cxnpl-ai/ms-365-mcp-server",
   "version": "0.4.9",
   "description": "Microsoft 365 MCP Server",
   "type": "module",
