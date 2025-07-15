@@ -3,6 +3,7 @@ import logger from './logger.js';
 import GraphClient from './graph-client.js';
 import { api } from './generated/client.js';
 import { z } from 'zod';
+import { getUserId, AuthenticationError } from './user-context.js';
 
 type TextContent = {
   type: 'text';
@@ -70,6 +71,10 @@ export function registerGraphTools(
     }
 
     const paramSchema: Record<string, any> = {};
+    
+    // Always add owui_token parameter
+    paramSchema['owui_token'] = z.string().describe('Authentication token from OpenWebUI');
+    
     if (tool.parameters && tool.parameters.length > 0) {
       for (const param of tool.parameters) {
         // Use z.any() as a fallback schema if the parameter schema is not specified
@@ -85,10 +90,12 @@ export function registerGraphTools(
         title: tool.alias,
         readOnlyHint: tool.method.toUpperCase() === 'GET',
       },
-      async (params, extra) => {
+      async (params) => {
         logger.info(`Tool ${tool.alias} called with params: ${JSON.stringify(params)}`);
         try {
-          logger.info(`params: ${JSON.stringify(params)}`);
+          const { owui_token, ...otherParams } = params;
+          const userId = getUserId(owui_token);
+          logger.info(`otherParams: ${JSON.stringify(otherParams)}`);
 
           const parameterDefinitions = tool.parameters || [];
 
@@ -96,7 +103,7 @@ export function registerGraphTools(
           const queryParams: Record<string, string> = {};
           const headers: Record<string, string> = {};
           let body: any = null;
-          for (let [paramName, paramValue] of Object.entries(params)) {
+          for (let [paramName, paramValue] of Object.entries(otherParams)) {
             const fixedParamName = paramName.replace(/__/g, '$');
             const paramDef = parameterDefinitions.find((p) => p.name === paramName);
 
@@ -143,7 +150,7 @@ export function registerGraphTools(
           }
 
           logger.info(`Making graph request to ${path} with options: ${JSON.stringify(options)}`);
-          const response = await graphClient.graphRequest(path, options);
+          const response = await graphClient.graphRequest(userId, path, options);
 
           // Convert McpResponse to CallToolResult with the correct structure
           const content: ContentItem[] = response.content.map((item) => {
@@ -163,6 +170,27 @@ export function registerGraphTools(
 
           return result;
         } catch (error) {
+          if (error instanceof AuthenticationError) {
+            logger.error(`Authentication failed for tool ${tool.alias}: ${error.message}`);
+            const authErrorContent: TextContent = {
+              type: 'text',
+              text: JSON.stringify({
+                error: 'Authentication failed',
+                message: error.message,
+                statusCode: 401
+              }),
+            };
+
+            return {
+              content: [authErrorContent],
+              isError: true,
+              _meta: {
+                statusCode: 401,
+                errorType: 'AuthenticationError'
+              }
+            };
+          }
+
           logger.error(`Error in tool ${tool.alias}: ${(error as Error).message}`);
           const errorContent: TextContent = {
             type: 'text',

@@ -35,7 +35,7 @@ class GraphClient {
     this.sessions = new Map();
   }
 
-  async createSession(filePath: string): Promise<string | null> {
+  async createSession(userId: string, filePath: string): Promise<string | null> {
     try {
       if (!filePath) {
         logger.error('No file path provided for Excel session');
@@ -47,7 +47,7 @@ class GraphClient {
       }
 
       logger.info(`Creating new Excel session for file: ${filePath}`);
-      const accessToken = await this.authManager.getToken();
+      const accessToken = await this.authManager.getToken(userId);
 
       const response = await fetch(
         `https://graph.microsoft.com/v1.0/me/drive/root:${filePath}:/workbook/createSession`,
@@ -78,10 +78,10 @@ class GraphClient {
     }
   }
 
-  async graphRequest(endpoint: string, options: GraphRequestOptions = {}): Promise<McpResponse> {
+  async graphRequest(userId: string, endpoint: string, options: GraphRequestOptions = {}): Promise<McpResponse> {
     try {
       logger.info(`Calling ${endpoint} with options: ${JSON.stringify(options)}`);
-      let accessToken = await this.authManager.getToken();
+      let accessToken = await this.authManager.getToken(userId);
 
       let url: string;
       let sessionId: string | null = null;
@@ -95,7 +95,7 @@ class GraphClient {
         sessionId = this.sessions.get(options.excelFile) || null;
 
         if (!sessionId) {
-          sessionId = await this.createSession(options.excelFile);
+          sessionId = await this.createSession(userId, options.excelFile);
         }
 
         url = `https://graph.microsoft.com/v1.0/me/drive/root:${options.excelFile}:${endpoint}`;
@@ -134,7 +134,7 @@ class GraphClient {
 
       if (response.status === 401) {
         logger.info('Access token expired, refreshing...');
-        const newToken = await this.authManager.getToken(true);
+        const newToken = await this.authManager.getToken(userId, true);
 
         if (
           options.excelFile &&
@@ -142,7 +142,7 @@ class GraphClient {
           !endpoint.startsWith('/users') &&
           !endpoint.startsWith('/me')
         ) {
-          sessionId = await this.createSession(options.excelFile);
+          sessionId = await this.createSession(userId, options.excelFile);
         }
 
         headers.Authorization = `Bearer ${newToken}`;
@@ -251,7 +251,7 @@ class GraphClient {
     }
   }
 
-  async closeSession(filePath: string): Promise<McpResponse> {
+  async closeSession(userId: string, filePath: string): Promise<McpResponse> {
     if (!filePath || !this.sessions.has(filePath)) {
       return {
         content: [
@@ -266,7 +266,7 @@ class GraphClient {
     const sessionId = this.sessions.get(filePath);
 
     try {
-      const accessToken = await this.authManager.getToken();
+      const accessToken = await this.authManager.getToken(userId);
       const response = await fetch(
         `https://graph.microsoft.com/v1.0/me/drive/root:${filePath}:/workbook/closeSession`,
         {
@@ -306,11 +306,11 @@ class GraphClient {
     }
   }
 
-  async closeAllSessions(): Promise<McpResponse> {
+  async closeAllSessions(userId: string): Promise<McpResponse> {
     const results: McpResponse[] = [];
 
     for (const [filePath] of this.sessions) {
-      const result = await this.closeSession(filePath);
+      const result = await this.closeSession(userId, filePath);
       results.push(result);
     }
 

@@ -1,19 +1,27 @@
 import type { Configuration } from '@azure/msal-node';
 import { PublicClientApplication } from '@azure/msal-node';
-import keytar from 'keytar';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
 import logger from './logger.js';
+
+// Try to import keytar, but make it optional
+let keytar: any = null;
+try {
+  keytar = await import('keytar');
+  logger.info('Keytar loaded successfully - using secure credential storage');
+} catch (error) {
+  logger.warn(`Keytar failed to load: ${(error as Error).message}. Falling back to file-based storage.`);
+}
 
 const endpoints = await import('./endpoints.json', {
   with: { type: 'json' },
 });
 
 const SERVICE_NAME = 'ms-365-mcp-server';
-const TOKEN_CACHE_ACCOUNT = 'msal-token-cache';
+const getTokenCacheAccount = (userId: string) => `msal-token-cache-${userId}`;
 const FALLBACK_DIR = path.dirname(fileURLToPath(import.meta.url));
-const FALLBACK_PATH = path.join(FALLBACK_DIR, '..', '.token-cache.json');
+const getFallbackPath = (userId: string) => path.join(FALLBACK_DIR, '..', `.token-cache-${userId}.json`);
 
 const DEFAULT_CONFIG: Configuration = {
   auth: {
@@ -62,12 +70,15 @@ interface LoginTestResult {
   };
 }
 
+interface UserTokenData {
+  accessToken: string | null;
+  tokenExpiry: number | null;
+  msalApp: PublicClientApplication;
+}
 class AuthManager {
   private config: Configuration;
   private scopes: string[];
-  private msalApp: PublicClientApplication;
-  private accessToken: string | null;
-  private tokenExpiry: number | null;
+  private userTokens: Map<string, UserTokenData>;
 
   constructor(
     config: Configuration = DEFAULT_CONFIG,
@@ -76,62 +87,89 @@ class AuthManager {
     logger.info(`And scopes are ${scopes.join(', ')}`, scopes);
     this.config = config;
     this.scopes = scopes;
-    this.msalApp = new PublicClientApplication(this.config);
-    this.accessToken = null;
-    this.tokenExpiry = null;
+    this.userTokens = new Map();
   }
 
-  async loadTokenCache(): Promise<void> {
+  private getUserTokenData(userId: string): UserTokenData {
+    if (!this.userTokens.has(userId)) {
+      logger.info(`Creating new token data for user: ${userId}`);
+      this.userTokens.set(userId, {
+        accessToken: null,
+        tokenExpiry: null,
+        msalApp: new PublicClientApplication(this.config),
+      });
+    }
+    return this.userTokens.get(userId)!;
+  }
+
+  async loadTokenCache(userId: string): Promise<void> {
     try {
+      const userTokenData = this.getUserTokenData(userId);
       let cacheData: string | undefined;
 
-      try {
-        const cachedData = await keytar.getPassword(SERVICE_NAME, TOKEN_CACHE_ACCOUNT);
-        if (cachedData) {
-          cacheData = cachedData;
+      // Try keytar first if available
+      if (keytar) {
+        try {
+          const cachedData = await keytar.getPassword(SERVICE_NAME, getTokenCacheAccount(userId));
+          if (cachedData) {
+            cacheData = cachedData;
+          }
+        } catch (keytarError) {
+          logger.warn(
+            `Keychain access failed, falling back to file storage: ${(keytarError as Error).message}`
+          );
         }
-      } catch (keytarError) {
-        logger.warn(
-          `Keychain access failed, falling back to file storage: ${(keytarError as Error).message}`
-        );
       }
 
-      if (!cacheData && fs.existsSync(FALLBACK_PATH)) {
-        cacheData = fs.readFileSync(FALLBACK_PATH, 'utf8');
+      // Fall back to file storage if keytar not available or failed
+      if (!cacheData) {
+        const fallbackPath = getFallbackPath(userId);
+        if (fs.existsSync(fallbackPath)) {
+          cacheData = fs.readFileSync(fallbackPath, 'utf8');
+        }
       }
 
       if (cacheData) {
-        this.msalApp.getTokenCache().deserialize(cacheData);
+        userTokenData.msalApp.getTokenCache().deserialize(cacheData);
       }
     } catch (error) {
-      logger.error(`Error loading token cache: ${(error as Error).message}`);
+      logger.error(`Error loading token cache for user ${userId}: ${(error as Error).message}`);
     }
   }
 
-  async saveTokenCache(): Promise<void> {
+  async saveTokenCache(userId: string): Promise<void> {
     try {
-      const cacheData = this.msalApp.getTokenCache().serialize();
+      const userTokenData = this.getUserTokenData(userId);
+      const cacheData = userTokenData.msalApp.getTokenCache().serialize();
 
-      try {
-        await keytar.setPassword(SERVICE_NAME, TOKEN_CACHE_ACCOUNT, cacheData);
-      } catch (keytarError) {
-        logger.warn(
-          `Keychain save failed, falling back to file storage: ${(keytarError as Error).message}`
-        );
-
-        fs.writeFileSync(FALLBACK_PATH, cacheData);
+      // Try keytar first if available
+      if (keytar) {
+        try {
+          await keytar.setPassword(SERVICE_NAME, getTokenCacheAccount(userId), cacheData);
+          return; // Success with keytar, no need to use file storage
+        } catch (keytarError) {
+          logger.warn(
+            `Keychain save failed, falling back to file storage: ${(keytarError as Error).message}`
+          );
+        }
       }
+
+      // Fall back to file storage if keytar not available or failed
+      const fallbackPath = getFallbackPath(userId);
+      fs.writeFileSync(fallbackPath, cacheData);
     } catch (error) {
-      logger.error(`Error saving token cache: ${(error as Error).message}`);
+      logger.error(`Error saving token cache for user ${userId}: ${(error as Error).message}`);
     }
   }
 
-  async getToken(forceRefresh = false): Promise<string | null> {
-    if (this.accessToken && this.tokenExpiry && this.tokenExpiry > Date.now() && !forceRefresh) {
-      return this.accessToken;
+  async getToken(userId: string, forceRefresh = false): Promise<string | null> {
+    const userTokenData = this.getUserTokenData(userId);
+    
+    if (userTokenData.accessToken && userTokenData.tokenExpiry && userTokenData.tokenExpiry > Date.now() && !forceRefresh) {
+      return userTokenData.accessToken;
     }
 
-    const accounts = await this.msalApp.getTokenCache().getAllAccounts();
+    const accounts = await userTokenData.msalApp.getTokenCache().getAllAccounts();
 
     if (accounts.length > 0) {
       const silentRequest = {
@@ -140,10 +178,10 @@ class AuthManager {
       };
 
       try {
-        const response = await this.msalApp.acquireTokenSilent(silentRequest);
-        this.accessToken = response.accessToken;
-        this.tokenExpiry = response.expiresOn ? new Date(response.expiresOn).getTime() : null;
-        return this.accessToken;
+        const response = await userTokenData.msalApp.acquireTokenSilent(silentRequest);
+        userTokenData.accessToken = response.accessToken;
+        userTokenData.tokenExpiry = response.expiresOn ? new Date(response.expiresOn).getTime() : null;
+        return userTokenData.accessToken;
       } catch (error) {
         logger.info('Silent token acquisition failed, using device code flow');
       }
@@ -152,7 +190,9 @@ class AuthManager {
     throw new Error('No valid token found');
   }
 
-  async acquireTokenByDeviceCode(hack?: (message: string) => void): Promise<string | null> {
+  async acquireTokenByDeviceCode(userId: string, hack?: (message: string) => void): Promise<string | null> {
+    const userTokenData = this.getUserTokenData(userId);
+    
     const deviceCodeRequest = {
       scopes: this.scopes,
       deviceCodeCallback: (response: { message: string }) => {
@@ -169,22 +209,22 @@ class AuthManager {
     try {
       logger.info('Requesting device code...');
       logger.info(`Scopes are: ${this.scopes.join(', ')}`);
-      const response = await this.msalApp.acquireTokenByDeviceCode(deviceCodeRequest);
+      const response = await userTokenData.msalApp.acquireTokenByDeviceCode(deviceCodeRequest);
       logger.info('Device code login successful');
-      this.accessToken = response?.accessToken || null;
-      this.tokenExpiry = response?.expiresOn ? new Date(response.expiresOn).getTime() : null;
-      await this.saveTokenCache();
-      return this.accessToken;
+      userTokenData.accessToken = response?.accessToken || null;
+      userTokenData.tokenExpiry = response?.expiresOn ? new Date(response.expiresOn).getTime() : null;
+      await this.saveTokenCache(userId);
+      return userTokenData.accessToken;
     } catch (error) {
       logger.error(`Error in device code flow: ${(error as Error).message}`);
       throw error;
     }
   }
 
-  async testLogin(): Promise<LoginTestResult> {
+  async testLogin(userId: string): Promise<LoginTestResult> {
     try {
-      logger.info('Testing login...');
-      const token = await this.getToken();
+      logger.info(`Testing login for user: ${userId}...`);
+      const token = await this.getToken(userId);
 
       if (!token) {
         logger.error('Login test failed - no token received');
@@ -238,28 +278,37 @@ class AuthManager {
     }
   }
 
-  async logout(): Promise<boolean> {
+  async logout(userId: string): Promise<boolean> {
     try {
-      const accounts = await this.msalApp.getTokenCache().getAllAccounts();
+      const userTokenData = this.getUserTokenData(userId);
+      const accounts = await userTokenData.msalApp.getTokenCache().getAllAccounts();
       for (const account of accounts) {
-        await this.msalApp.getTokenCache().removeAccount(account);
+        await userTokenData.msalApp.getTokenCache().removeAccount(account);
       }
-      this.accessToken = null;
-      this.tokenExpiry = null;
+      userTokenData.accessToken = null;
+      userTokenData.tokenExpiry = null;
 
-      try {
-        await keytar.deletePassword(SERVICE_NAME, TOKEN_CACHE_ACCOUNT);
-      } catch (keytarError) {
-        logger.warn(`Keychain deletion failed: ${(keytarError as Error).message}`);
+      // Clear stored credentials
+      if (keytar) {
+        try {
+          await keytar.deletePassword(SERVICE_NAME, getTokenCacheAccount(userId));
+        } catch (keytarError) {
+          logger.warn(`Keychain deletion failed: ${(keytarError as Error).message}`);
+        }
       }
 
-      if (fs.existsSync(FALLBACK_PATH)) {
-        fs.unlinkSync(FALLBACK_PATH);
+      // Clean up file-based storage
+      const fallbackPath = getFallbackPath(userId);
+      if (fs.existsSync(fallbackPath)) {
+        fs.unlinkSync(fallbackPath);
       }
+
+      // Remove user data from memory
+      this.userTokens.delete(userId);
 
       return true;
     } catch (error) {
-      logger.error(`Error during logout: ${(error as Error).message}`);
+      logger.error(`Error during logout for user ${userId}: ${(error as Error).message}`);
       throw error;
     }
   }
