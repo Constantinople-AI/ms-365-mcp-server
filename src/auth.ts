@@ -3,25 +3,107 @@ import { PublicClientApplication } from '@azure/msal-node';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import logger from './logger.js';
 
-// Try to import keytar, but make it optional
-let keytar: any = null;
-try {
-  keytar = await import('keytar');
-  logger.info('Keytar loaded successfully - using secure credential storage');
-} catch (error) {
-  logger.warn(`Keytar failed to load: ${(error as Error).message}. Falling back to file-based storage.`);
+class CryptoManager {
+  private masterKey: Buffer;
+  private static readonly ALGORITHM = 'aes-256-gcm';
+  private static readonly IV_LENGTH = 12;
+  private static readonly SALT_LENGTH = 16;
+  private static readonly AUTH_TAG_LENGTH = 16;
+  private static readonly KEY_LENGTH = 32;
+
+  constructor(masterKeyHex: string) {
+    if (!masterKeyHex) {
+      throw new Error('A master encryption key is required. Please set MS365_MCP_MASTER_KEY.');
+    }
+    const masterKey = Buffer.from(masterKeyHex, 'hex');
+    if (masterKey.length !== 32) {
+      throw new Error('Master key must be a 32-byte (64-character hex) string.');
+    }
+    this.masterKey = masterKey;
+  }
+
+  private deriveKey(salt: Buffer, userId: string): Buffer {
+    return crypto.hkdfSync(
+      'sha256',
+      this.masterKey,
+      salt,
+      `mcp-ms365-${userId}`,
+      CryptoManager.KEY_LENGTH
+    ) as Buffer;
+  }
+
+  encrypt(data: string, userId: string): string {
+    const salt = crypto.randomBytes(CryptoManager.SALT_LENGTH);
+    const key = this.deriveKey(salt, userId);
+    const iv = crypto.randomBytes(CryptoManager.IV_LENGTH);
+
+    const cipher = crypto.createCipheriv(CryptoManager.ALGORITHM, key, iv);
+    const encrypted = Buffer.concat([cipher.update(data, 'utf8'), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+
+    return Buffer.concat([salt, iv, authTag, encrypted]).toString('base64');
+  }
+
+  decrypt(encryptedPayload: string, userId: string): string {
+    try {
+      const dataBuffer = Buffer.from(encryptedPayload, 'base64');
+
+      const salt = dataBuffer.subarray(0, CryptoManager.SALT_LENGTH);
+      const iv = dataBuffer.subarray(
+        CryptoManager.SALT_LENGTH,
+        CryptoManager.SALT_LENGTH + CryptoManager.IV_LENGTH
+      );
+      const authTag = dataBuffer.subarray(
+        CryptoManager.SALT_LENGTH + CryptoManager.IV_LENGTH,
+        CryptoManager.SALT_LENGTH + CryptoManager.IV_LENGTH + CryptoManager.AUTH_TAG_LENGTH
+      );
+      const encrypted = dataBuffer.subarray(
+        CryptoManager.SALT_LENGTH + CryptoManager.IV_LENGTH + CryptoManager.AUTH_TAG_LENGTH
+      );
+
+      const key = this.deriveKey(salt, userId);
+
+      const decipher = crypto.createDecipheriv(CryptoManager.ALGORITHM, key, iv);
+      decipher.setAuthTag(authTag);
+
+      const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+      return decrypted.toString('utf8');
+    } catch (error) {
+      logger.error(`Decryption failed: ${(error as Error).message}. The master key may have changed or data is corrupt.`);
+      throw new Error('Failed to decrypt token cache.');
+    }
+  }
 }
+
+const masterKey = process.env.MS365_MCP_MASTER_KEY;
+if (!masterKey) {
+  logger.warn(
+    'MS365_MCP_MASTER_KEY environment variable not set. Token cache will not be encrypted. This is not recommended for production.'
+  );
+  logger.warn(
+    `To generate a key, run: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
+  );
+}
+
+const cryptoManager = masterKey ? new CryptoManager(masterKey) : null;
 
 const endpoints = await import('./endpoints.json', {
   with: { type: 'json' },
 });
 
-const SERVICE_NAME = 'ms-365-mcp-server';
-const getTokenCacheAccount = (userId: string) => `msal-token-cache-${userId}`;
-const FALLBACK_DIR = path.dirname(fileURLToPath(import.meta.url));
-const getFallbackPath = (userId: string) => path.join(FALLBACK_DIR, '..', `.token-cache-${userId}.json`);
+const CACHE_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '.cache');
+
+if (!fs.existsSync(CACHE_DIR)) {
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+}
+
+const getCachePath = (userId: string) => {
+  const hashedUserId = crypto.createHash('sha256').update(userId).digest('hex');
+  return path.join(CACHE_DIR, `token-cache-${hashedUserId}.json.enc`);
+};
 
 const DEFAULT_CONFIG: Configuration = {
   auth: {
@@ -98,6 +180,10 @@ class AuthManager {
         tokenExpiry: null,
         msalApp: new PublicClientApplication(this.config),
       });
+      // Load the cache for the new user instance
+      this.loadTokenCache(userId).catch((error) => {
+        logger.error(`Failed to lazy-load token cache for ${userId}: ${error}`);
+      });
     }
     return this.userTokens.get(userId)!;
   }
@@ -105,32 +191,19 @@ class AuthManager {
   async loadTokenCache(userId: string): Promise<void> {
     try {
       const userTokenData = this.getUserTokenData(userId);
-      let cacheData: string | undefined;
+      const cachePath = getCachePath(userId);
 
-      // Try keytar first if available
-      if (keytar) {
-        try {
-          const cachedData = await keytar.getPassword(SERVICE_NAME, getTokenCacheAccount(userId));
-          if (cachedData) {
-            cacheData = cachedData;
-          }
-        } catch (keytarError) {
-          logger.warn(
-            `Keychain access failed, falling back to file storage: ${(keytarError as Error).message}`
-          );
-        }
+      if (!fs.existsSync(cachePath)) {
+        return;
       }
 
-      // Fall back to file storage if keytar not available or failed
-      if (!cacheData) {
-        const fallbackPath = getFallbackPath(userId);
-        if (fs.existsSync(fallbackPath)) {
-          cacheData = fs.readFileSync(fallbackPath, 'utf8');
-        }
-      }
+      const fileContent = fs.readFileSync(cachePath, 'utf8');
 
-      if (cacheData) {
-        userTokenData.msalApp.getTokenCache().deserialize(cacheData);
+      if (cryptoManager) {
+        const decryptedCache = cryptoManager.decrypt(fileContent, userId);
+        userTokenData.msalApp.getTokenCache().deserialize(decryptedCache);
+      } else {
+        userTokenData.msalApp.getTokenCache().deserialize(fileContent);
       }
     } catch (error) {
       logger.error(`Error loading token cache for user ${userId}: ${(error as Error).message}`);
@@ -140,23 +213,18 @@ class AuthManager {
   async saveTokenCache(userId: string): Promise<void> {
     try {
       const userTokenData = this.getUserTokenData(userId);
-      const cacheData = userTokenData.msalApp.getTokenCache().serialize();
-
-      // Try keytar first if available
-      if (keytar) {
-        try {
-          await keytar.setPassword(SERVICE_NAME, getTokenCacheAccount(userId), cacheData);
-          return; // Success with keytar, no need to use file storage
-        } catch (keytarError) {
-          logger.warn(
-            `Keychain save failed, falling back to file storage: ${(keytarError as Error).message}`
-          );
-        }
+      if (!userTokenData.msalApp.getTokenCache().hasChanged) {
+        return;
       }
+      const cacheData = userTokenData.msalApp.getTokenCache().serialize();
+      const cachePath = getCachePath(userId);
 
-      // Fall back to file storage if keytar not available or failed
-      const fallbackPath = getFallbackPath(userId);
-      fs.writeFileSync(fallbackPath, cacheData);
+      if (cryptoManager) {
+        const encryptedCache = cryptoManager.encrypt(cacheData, userId);
+        fs.writeFileSync(cachePath, encryptedCache);
+      } else {
+        fs.writeFileSync(cachePath, cacheData);
+      }
     } catch (error) {
       logger.error(`Error saving token cache for user ${userId}: ${(error as Error).message}`);
     }
@@ -164,8 +232,13 @@ class AuthManager {
 
   async getToken(userId: string, forceRefresh = false): Promise<string | null> {
     const userTokenData = this.getUserTokenData(userId);
-    
-    if (userTokenData.accessToken && userTokenData.tokenExpiry && userTokenData.tokenExpiry > Date.now() && !forceRefresh) {
+
+    if (
+      !forceRefresh &&
+      userTokenData.accessToken &&
+      userTokenData.tokenExpiry &&
+      userTokenData.tokenExpiry > Date.now()
+    ) {
       return userTokenData.accessToken;
     }
 
@@ -181,6 +254,7 @@ class AuthManager {
         const response = await userTokenData.msalApp.acquireTokenSilent(silentRequest);
         userTokenData.accessToken = response.accessToken;
         userTokenData.tokenExpiry = response.expiresOn ? new Date(response.expiresOn).getTime() : null;
+        await this.saveTokenCache(userId);
         return userTokenData.accessToken;
       } catch (error) {
         logger.info('Silent token acquisition failed, using device code flow');
@@ -192,7 +266,7 @@ class AuthManager {
 
   async acquireTokenByDeviceCode(userId: string, hack?: (message: string) => void): Promise<string | null> {
     const userTokenData = this.getUserTokenData(userId);
-    
+
     const deviceCodeRequest = {
       scopes: this.scopes,
       deviceCodeCallback: (response: { message: string }) => {
@@ -288,22 +362,11 @@ class AuthManager {
       userTokenData.accessToken = null;
       userTokenData.tokenExpiry = null;
 
-      // Clear stored credentials
-      if (keytar) {
-        try {
-          await keytar.deletePassword(SERVICE_NAME, getTokenCacheAccount(userId));
-        } catch (keytarError) {
-          logger.warn(`Keychain deletion failed: ${(keytarError as Error).message}`);
-        }
+      const cachePath = getCachePath(userId);
+      if (fs.existsSync(cachePath)) {
+        fs.unlinkSync(cachePath);
       }
 
-      // Clean up file-based storage
-      const fallbackPath = getFallbackPath(userId);
-      if (fs.existsSync(fallbackPath)) {
-        fs.unlinkSync(fallbackPath);
-      }
-
-      // Remove user data from memory
       this.userTokens.delete(userId);
 
       return true;
