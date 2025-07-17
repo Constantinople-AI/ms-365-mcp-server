@@ -8,6 +8,7 @@ import logger from './logger.js';
 
 class CryptoManager {
   private masterKey: Buffer;
+  // Changing any of these values will break existing token caches, be careful!
   private static readonly ALGORITHM = 'aes-256-gcm';
   private static readonly IV_LENGTH = 12;
   private static readonly SALT_LENGTH = 16;
@@ -20,7 +21,7 @@ class CryptoManager {
     }
     const masterKey = Buffer.from(masterKeyHex, 'hex');
     if (masterKey.length !== 32) {
-      throw new Error('Master key must be a 32-byte (64-character hex) string.');
+      throw new Error('Master key must be a 32-byte (64-character hex) string; currently ' + masterKey.length + ' bytes.');
     }
     this.masterKey = masterKey;
   }
@@ -80,15 +81,14 @@ class CryptoManager {
 
 const masterKey = process.env.MS365_MCP_MASTER_KEY;
 if (!masterKey) {
-  logger.warn(
-    'MS365_MCP_MASTER_KEY environment variable not set. Token cache will not be encrypted. This is not recommended for production.'
-  );
-  logger.warn(
-    `To generate a key, run: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
-  );
+  const errorMessage =
+    'MS365_MCP_MASTER_KEY environment variable not set. This is required for secure token storage.';
+  logger.error(errorMessage);
+  logger.error(`To generate a key, run: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`);
+  throw new Error(errorMessage);
 }
 
-const cryptoManager = masterKey ? new CryptoManager(masterKey) : null;
+const cryptoManager = new CryptoManager(masterKey);
 
 const endpoints = await import('./endpoints.json', {
   with: { type: 'json' },
@@ -101,9 +101,18 @@ if (!fs.existsSync(CACHE_DIR)) {
 }
 
 const getCachePath = (userId: string) => {
-  const hashedUserId = crypto.createHash('sha256').update(userId).digest('hex');
-  return path.join(CACHE_DIR, `token-cache-${hashedUserId}.json.enc`);
+  // Use HMAC with the master key for the filename to prevent linking users to files.
+  const hashedUserId = crypto.createHmac('sha256', Buffer.from(masterKey, 'hex')).update(userId).digest('hex');
+
+  // Encryption is always on, so the extension is always .enc
+  const extension = '.json.enc';
+  return path.join(CACHE_DIR, `.token-cache-${hashedUserId}${extension}`);
 };
+
+interface TokenCacheData {
+  msalCache: string;
+  createdAt: number;
+}
 
 const DEFAULT_CONFIG: Configuration = {
   auth: {
@@ -189,24 +198,34 @@ class AuthManager {
   }
 
   async loadTokenCache(userId: string): Promise<void> {
+    const cachePath = getCachePath(userId);
+    if (!fs.existsSync(cachePath)) {
+      return;
+    }
+
     try {
       const userTokenData = this.getUserTokenData(userId);
-      const cachePath = getCachePath(userId);
-
-      if (!fs.existsSync(cachePath)) {
-        return;
-      }
-
       const fileContent = fs.readFileSync(cachePath, 'utf8');
+      const decryptedCache = cryptoManager.decrypt(fileContent, userId);
+      const tokenData: TokenCacheData = JSON.parse(decryptedCache);
 
-      if (cryptoManager) {
-        const decryptedCache = cryptoManager.decrypt(fileContent, userId);
-        userTokenData.msalApp.getTokenCache().deserialize(decryptedCache);
-      } else {
-        userTokenData.msalApp.getTokenCache().deserialize(fileContent);
+      const tokenTTLDays = process.env.MS365_MCP_TOKEN_TTL_DAYS;
+      if (tokenTTLDays) {
+        const ttlMs = parseInt(tokenTTLDays, 10) * 24 * 60 * 60 * 1000;
+        const tokenAgeMs = Date.now() - tokenData.createdAt;
+
+        if (tokenAgeMs > ttlMs) {
+          logger.info(`Token for user ${userId} has expired based on TTL. Logging out.`);
+          await this.logout(userId);
+          return; // Logout clears the cache, so we stop here.
+        }
       }
+
+      userTokenData.msalApp.getTokenCache().deserialize(tokenData.msalCache);
     } catch (error) {
       logger.error(`Error loading token cache for user ${userId}: ${(error as Error).message}`);
+      logger.warn(`Corrupted token for user ${userId} found. Deleting it.`);
+      await this.logout(userId);
     }
   }
 
@@ -216,15 +235,36 @@ class AuthManager {
       if (!userTokenData.msalApp.getTokenCache().hasChanged) {
         return;
       }
-      const cacheData = userTokenData.msalApp.getTokenCache().serialize();
       const cachePath = getCachePath(userId);
+      let createdAt = Date.now();
 
-      if (cryptoManager) {
-        const encryptedCache = cryptoManager.encrypt(cacheData, userId);
-        fs.writeFileSync(cachePath, encryptedCache);
-      } else {
-        fs.writeFileSync(cachePath, cacheData);
+      // If a token already exists, preserve its original creation date
+      if (fs.existsSync(cachePath)) {
+        try {
+          const oldFileContent = fs.readFileSync(cachePath, 'utf8');
+          const oldDecryptedCache = cryptoManager.decrypt(oldFileContent, userId);
+          const oldTokenData: TokenCacheData = JSON.parse(oldDecryptedCache);
+          if (oldTokenData.createdAt) {
+            createdAt = oldTokenData.createdAt;
+          }
+        } catch (error) {
+          logger.warn(
+            `Could not parse existing token for user ${userId} to preserve createdAt. Resetting TTL. Error: ${
+              (error as Error).message
+            }`
+          );
+        }
       }
+
+      const msalCache = userTokenData.msalApp.getTokenCache().serialize();
+
+      const tokenData: TokenCacheData = {
+        msalCache,
+        createdAt,
+      };
+
+      const encryptedCache = cryptoManager.encrypt(JSON.stringify(tokenData), userId);
+      fs.writeFileSync(cachePath, encryptedCache);
     } catch (error) {
       logger.error(`Error saving token cache for user ${userId}: ${(error as Error).message}`);
     }
